@@ -247,6 +247,10 @@ def main():
             logging.debug("PTP synchronized.")
     # Configures the camera for 3840x2160, 60fps
     camera.configure()
+
+    # IMX477 Analog gain settings functions. msb_reg contains MSB 2 bits and lsb_reg contains LSB 8 bits. Users are free to experiment with the register values.
+    camera.set_analog_gain_msb_reg(0x3)  # analog MSB 2 bits
+    camera.set_analog_gain_lsb_reg(0x3F)  # analog LSB 8 bits
     if args.pattern:
         camera.set_pattern()
     application.run()
