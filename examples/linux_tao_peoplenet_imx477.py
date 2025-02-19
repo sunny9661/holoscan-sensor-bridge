@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2023-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -18,9 +18,11 @@
 import argparse
 import ctypes
 import logging
+import os
 
 import holoscan
 from cuda import cuda
+from tao_peoplenet import FormatInferenceInputOp, PostprocessorOp
 
 import hololink as hololink_module
 
@@ -33,10 +35,9 @@ class HoloscanApplication(holoscan.core.Application):
         cuda_context,
         cuda_device_ordinal,
         hololink_channel,
-        ibv_name,
-        ibv_port,
         camera,
         frame_limit,
+        engine,
     ):
         logging.info("__init__")
         super().__init__()
@@ -45,10 +46,9 @@ class HoloscanApplication(holoscan.core.Application):
         self._cuda_context = cuda_context
         self._cuda_device_ordinal = cuda_device_ordinal
         self._hololink_channel = hololink_channel
-        self._ibv_name = ibv_name
-        self._ibv_port = ibv_port
         self._camera = camera
         self._frame_limit = frame_limit
+        self._engine = engine
 
     def compose(self):
         logging.info("compose")
@@ -84,39 +84,36 @@ class HoloscanApplication(holoscan.core.Application):
         self._camera.configure_converter(csi_to_bayer_operator)
 
         frame_size = csi_to_bayer_operator.get_csi_length()
-        logging.info(f"{frame_size=}")
         frame_context = self._cuda_context
-        receiver_operator = hololink_module.operators.RoceReceiverOp(
+        receiver_operator = hololink_module.operators.LinuxReceiverOperator(
             self,
             condition,
             name="receiver",
             frame_size=frame_size,
             frame_context=frame_context,
-            ibv_name=self._ibv_name,
-            ibv_port=self._ibv_port,
             hololink_channel=self._hololink_channel,
             device=self._camera,
         )
 
-        pixel_format = self._camera.pixel_format()
         bayer_format = self._camera.bayer_format()
+        pixel_format = self._camera.pixel_format()
         image_processor_operator = hololink_module.operators.ImageProcessorOp(
             self,
             name="image_processor",
-            # Optical black value for IMX477 is 100
-            optical_black=100,
+            # Optical black value for imx274 is 50
+            optical_black=50,
             bayer_format=bayer_format.value,
             pixel_format=pixel_format.value,
         )
 
-        rgba_components_per_pixel = 4
+        rgb_components_per_pixel = 3
         bayer_pool = holoscan.resources.BlockMemoryPool(
             self,
             name="pool",
             # storage_type of 1 is device memory
             storage_type=1,
             block_size=self._camera._width
-            * rgba_components_per_pixel
+            * rgb_components_per_pixel
             * ctypes.sizeof(ctypes.c_uint16)
             * self._camera._height,
             num_blocks=2,
@@ -125,10 +122,13 @@ class HoloscanApplication(holoscan.core.Application):
             self,
             name="demosaic",
             pool=bayer_pool,
-            generate_alpha=True,
-            alpha_value=65535,
+            generate_alpha=False,
             bayer_grid_pos=bayer_format.value,
             interpolation_mode=0,
+        )
+
+        image_shift = hololink_module.operators.ImageShiftToUint8Operator(
+            self, name="image_shift", shift=8
         )
 
         visualizer = holoscan.operators.HolovizOp(
@@ -136,6 +136,41 @@ class HoloscanApplication(holoscan.core.Application):
             name="holoviz",
             fullscreen=self._fullscreen,
             headless=self._headless,
+            framebuffer_srgb=True,
+            **self.kwargs("holoviz"),
+        )
+
+        #
+        pool = holoscan.resources.UnboundedAllocator(self)
+        preprocessor_args = self.kwargs("preprocessor")
+        preprocessor = holoscan.operators.FormatConverterOp(
+            self,
+            name="preprocessor",
+            pool=pool,
+            **preprocessor_args,
+        )
+        format_input = FormatInferenceInputOp(
+            self,
+            name="transpose",
+            pool=pool,
+        )
+        inference = holoscan.operators.InferenceOp(
+            self,
+            name="inference",
+            allocator=pool,
+            model_path_map={
+                "face_detect": self._engine,
+            },
+            **self.kwargs("inference"),
+        )
+        postprocessor_args = self.kwargs("postprocessor")
+        postprocessor_args["image_width"] = preprocessor_args["resize_width"]
+        postprocessor_args["image_height"] = preprocessor_args["resize_height"]
+        postprocessor = PostprocessorOp(
+            self,
+            name="postprocessor",
+            allocator=pool,
+            **postprocessor_args,
         )
 
         #
@@ -144,16 +179,17 @@ class HoloscanApplication(holoscan.core.Application):
             csi_to_bayer_operator, image_processor_operator, {("output", "input")}
         )
         self.add_flow(image_processor_operator, demosaic, {("output", "receiver")})
-        self.add_flow(demosaic, visualizer, {("transmitter", "receivers")})
+        self.add_flow(demosaic, image_shift, {("transmitter", "input")})
+        self.add_flow(image_shift, visualizer, {("output", "receivers")})
+        self.add_flow(image_shift, preprocessor, {("output", "")})
+        self.add_flow(preprocessor, format_input)
+        self.add_flow(format_input, inference, {("", "receivers")})
+        self.add_flow(inference, postprocessor, {("transmitter", "in")})
+        self.add_flow(postprocessor, visualizer, {("out", "receivers")})
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--hololink",
-        default="192.168.0.2",
-        help="IP address of Hololink board",
-    )
     parser.add_argument("--headless", action="store_true", help="Run in headless mode")
     parser.add_argument(
         "--fullscreen", action="store_true", help="Run in fullscreen mode"
@@ -164,6 +200,21 @@ def main():
         default=None,
         help="Exit after receiving this many frames",
     )
+    default_configuration = os.path.join(
+        os.path.dirname(__file__), "tao_peoplenet.yaml"
+    )
+    parser.add_argument(
+        "--configuration", default=default_configuration, help="Configuration file"
+    )
+
+    default_engine = os.path.join(
+        os.path.dirname(__file__), "resnet34_peoplenet_int8.onnx"
+    )
+    parser.add_argument(
+        "--engine",
+        default=default_engine,
+        help="TRT engine model",
+    )
     parser.add_argument(
         "--log-level",
         type=int,
@@ -171,33 +222,11 @@ def main():
         help="Logging level to display",
     )
     parser.add_argument(
-        "--camera",
+        "--cam",
         type=int,
         default=0,
         choices=(0, 1),
         help="which camera to stream: 0 to stream camera connected to j14 or 1 to stream camera connected to j17 (default is 0)",
-    )
-    infiniband_devices = hololink_module.infiniband_devices()
-    parser.add_argument(
-        "--ibv-name",
-        default=infiniband_devices[0],
-        help="IBV device to use",
-    )
-    parser.add_argument(
-        "--ibv-port",
-        type=int,
-        default=1,
-        help="Port number of IBV device",
-    )
-    parser.add_argument(
-        "--pattern",
-        action="store_true",
-        help="Configure to display a test pattern.",
-    )
-    parser.add_argument(
-        "--ptp-sync",
-        action="store_true",
-        help="After reset, wait for PTP time to synchronize.",
     )
     args = parser.parse_args()
     hololink_module.logging_level(args.log_level)
@@ -208,15 +237,24 @@ def main():
     cu_device_ordinal = 0
     cu_result, cu_device = cuda.cuDeviceGet(cu_device_ordinal)
     assert cu_result == cuda.CUresult.CUDA_SUCCESS
-    cu_result, cu_context = cuda.cuCtxCreate(0, cu_device)
+    cu_result, cu_context = cuda.cuDevicePrimaryCtxRetain(cu_device)
     assert cu_result == cuda.CUresult.CUDA_SUCCESS
-
     # Get a handle to the Hololink device
-    channel_metadata = hololink_module.Enumerator.find_channel(channel_ip=args.hololink)
+
+    if args.cam == 0:
+        channel_metadata = hololink_module.Enumerator.find_channel(
+            channel_ip="192.168.0.2"
+        )
+    elif args.cam == 1:
+        channel_metadata = hololink_module.Enumerator.find_channel(
+            channel_ip="192.168.0.3"
+        )
+    else:
+        raise Exception(f"Unexpected camera={args.cam}")
 
     hololink_channel = hololink_module.DataChannel(channel_metadata)
-    # Get a handle to the camera
-    camera = hololink_module.sensors.imx477.Imx477(hololink_channel, args.camera)
+
+    camera = hololink_module.sensors.imx477.Imx477(hololink_channel, args.cam)
 
     # Set up the application
     application = HoloscanApplication(
@@ -225,36 +263,25 @@ def main():
         cu_context,
         cu_device_ordinal,
         hololink_channel,
-        args.ibv_name,
-        args.ibv_port,
         camera,
         args.frame_limit,
+        args.engine,
     )
-
+    application.config(args.configuration)
     # Run it.
     hololink = hololink_channel.hololink()
     hololink.start()
     hololink.reset()
-    if args.ptp_sync:
-        ptp_sync_timeout_s = 10
-        ptp_sync_timeout = hololink_module.Timeout(ptp_sync_timeout_s)
-        logging.debug("Waiting for PTP sync.")
-        if not hololink.ptp_synchronize(ptp_sync_timeout):
-            logging.error(
-                f"Failed to synchronize PTP after {ptp_sync_timeout_s} seconds; ignoring."
-            )
-        else:
-            logging.debug("PTP synchronized.")
-    # Configures the camera for 3840x2160, 60fps
     camera.configure()
 
     # IMX477 Analog gain settings registers. register 204 contains MSB 2 bits and register 205 contains LSB 8 bits. Users are free to experiment with the register values
-    camera.set_register(0x204, 0x3)  # analog MSB 2 bits
-    camera.set_register(0x205, 0x3F)  # analog LSB 8 bits
-    if args.pattern:
-        camera.set_pattern()
+    camera.set_register(0x204, 0x2)  # analog MSB 2 bits
+    camera.set_register(0x205, 0xFF)  # analog LSB 8 bits
     application.run()
     hololink.stop()
+
+    (cu_result,) = cuda.cuDevicePrimaryCtxRelease(cu_device)
+    assert cu_result == cuda.CUresult.CUDA_SUCCESS
 
 
 if __name__ == "__main__":

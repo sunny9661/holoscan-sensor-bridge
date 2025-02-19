@@ -217,6 +217,11 @@ def main():
     hololink.reset()
     # Configures the camera for 3840x2160, 60fps
     camera.configure()
+
+    # IMX477 Analog gain settings registers. register 204 contains MSB 2 bits and register 205 contains LSB 8 bits. Users are free to experiment with the register values
+    camera.set_register(0x204, 0x3)  # analog MSB 2 bits
+    camera.set_register(0x205, 0x3F)  # analog LSB 8 bits
+
     if args.pattern:
         camera.set_pattern()
     application.run()
